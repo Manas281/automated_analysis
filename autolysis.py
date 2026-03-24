@@ -10,36 +10,41 @@
 
 import sys
 import os
+import time
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import requests
 
 
-# -------------------- STEP 1: LOAD DATA --------------------
+# LOAD DATA
 
+# simple csv loader, added fallback in case encoding causes issues
 def load_csv(path):
-    """Load CSV file with encoding fallback"""
     try:
         return pd.read_csv(path)
     except UnicodeDecodeError:
-        # Fallback for non-UTF8 CSV files
+        # sometimes csvs are not utf-8, so trying latin1
         return pd.read_csv(path, encoding="latin1")
 
 
-
-# -------------------- STEP 2: BASIC ANALYSIS --------------------
+# BASIC ANALYSIS 
 
 def analyze_data(df):
     analysis = {}
 
+    # basic info
     analysis["rows"] = df.shape[0]
     analysis["columns"] = df.shape[1]
     analysis["column_names"] = list(df.columns)
-    analysis["column_types"] = df.dtypes.astype(str).to_dict()
-    analysis["missing_values"] = df.isnull().sum().to_dict()
-    analysis["summary"] = df.describe(include="all").to_dict()
 
+    # datatype info 
+    analysis["column_types"] = df.dtypes.astype(str).to_dict()
+
+    # checking missing values
+    analysis["missing_values"] = df.isnull().sum().to_dict()
+
+    # correlation only if numeric columns exist
     numeric_df = df.select_dtypes(include="number")
     if numeric_df.shape[1] >= 2:
         analysis["correlation"] = numeric_df.corr().to_dict()
@@ -49,8 +54,39 @@ def analyze_data(df):
     return analysis
 
 
-# -------------------- STEP 3: VISUALIZATION --------------------
+# OUTLIER DETECTION
 
+def detect_outliers(df):
+    numeric = df.select_dtypes(include="number")
+    outliers = {}
+
+    for col in numeric.columns:
+        q1 = numeric[col].quantile(0.25)
+        q3 = numeric[col].quantile(0.75)
+        iqr = q3 - q1
+
+        # counting how many values fall outside normal range
+        outliers[col] = int(((numeric[col] < q1 - 1.5 * iqr) |
+                             (numeric[col] > q3 + 1.5 * iqr)).sum())
+
+    return outliers
+
+
+# COMPRESS DATA
+
+def compress_analysis(analysis):
+    return {
+        "rows": analysis["rows"],
+        "columns": analysis["columns"],
+        "column_names": analysis["column_names"],
+        "missing_values": analysis["missing_values"],
+        "outliers": analysis.get("outliers", {})
+    }
+
+
+# VISUALIZATION
+
+# plot for missing values
 def plot_missing_values(df):
     missing = df.isnull().sum()
     missing = missing[missing > 0]
@@ -69,6 +105,7 @@ def plot_missing_values(df):
     return "missing_values.png"
 
 
+# correlation heatmap for numeric data
 def plot_correlation(df):
     numeric_df = df.select_dtypes(include="number")
     if numeric_df.shape[1] < 2:
@@ -84,12 +121,12 @@ def plot_correlation(df):
     return "correlation.png"
 
 
-# -------------------- STEP 4: GROQ LLM CALL (FREE) --------------------
+# LLM CALL
 
 def call_llm(prompt):
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY") or os.getenv("AIPROXY_TOKEN")
     if not api_key:
-        raise Exception("GROQ_API_KEY not set")
+        raise Exception("API key not set")
 
     url = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -101,46 +138,75 @@ def call_llm(prompt):
     data = {
         "model": "llama-3.1-8b-instant",
         "messages": [
-            {"role": "system", "content": "You are a helpful data analysis assistant."},
+            {"role": "system", "content": "You are a helpful data analyst."},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.3,
-        "max_tokens": 500   # ✅ REQUIRED FOR GROQ
+        "max_tokens": 400  
     }
 
-    response = requests.post(url, headers=headers, json=data)
+    # retry logic 
+    for attempt in range(3):
+        try:
+            response = requests.post(url, headers=headers, json=data)
 
-    # If something goes wrong, this will show exact reason
-    if response.status_code != 200:
-        print("Groq Error Response:", response.text)
+            if response.status_code != 200:
+                print("API error:", response.text)
 
-    response.raise_for_status()
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
 
-    return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            time.sleep(2)
 
 
+# INSIGHTS 
 
-# -------------------- STEP 5: README GENERATION --------------------
-
-def generate_readme(analysis, charts):
+def get_insights(summary):
     prompt = f"""
-Dataset Details:
-Rows: {analysis['rows']}
-Columns: {analysis['columns']}
-Column Names: {analysis['column_names']}
-Missing Values: {analysis['missing_values']}
+You are a data analyst.
 
-Write a simple README with:
+Dataset summary:
+{summary}
+
+Give:
+1. 5 key insights
+2. Patterns or trends
+3. Anything unusual
+
+Keep it short and simple.
+"""
+    return call_llm(prompt)
+
+
+# README GENERATION
+
+def generate_readme(summary, charts):
+    insights = get_insights(summary)
+
+    prompt = f"""
+You are a data analyst.
+
+Dataset:
+{summary}
+
+Insights:
+{insights}
+
+Write a README with:
 1. Dataset Overview
-2. Analysis Performed
-3. Key Observations
+2. Analysis Done
+3. Key Insights
 4. Conclusion
 
-Use simple intern-level language.
+Make it simple but interesting.
 """
 
     content = call_llm(prompt)
 
+    # adding charts at the end
     if charts:
         content += "\n\n## Visualizations\n"
         for chart in charts:
@@ -149,7 +215,7 @@ Use simple intern-level language.
     return content
 
 
-# -------------------- MAIN FUNCTION --------------------
+# MAIN
 
 def main():
     if len(sys.argv) != 2:
@@ -159,10 +225,17 @@ def main():
     csv_path = sys.argv[1]
 
     df = load_csv(csv_path)
+
+    # doing analysis
     analysis = analyze_data(df)
+    analysis["outliers"] = detect_outliers(df)
+
+    # compressing before sending to LLM
+    summary = compress_analysis(analysis)
 
     charts = []
 
+    # generating charts
     mv_chart = plot_missing_values(df)
     if mv_chart:
         charts.append(mv_chart)
@@ -171,12 +244,13 @@ def main():
     if corr_chart:
         charts.append(corr_chart)
 
-    readme = generate_readme(analysis, charts)
+    # generating final README
+    readme = generate_readme(summary, charts)
 
     with open("README.md", "w", encoding="utf-8") as f:
         f.write(readme)
 
-    print("✅ Analysis complete. README.md and charts generated.")
+    print(" Analysis complete. README.md and charts generated.")
 
 
 if __name__ == "__main__":
